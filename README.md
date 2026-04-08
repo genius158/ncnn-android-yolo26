@@ -1,3 +1,8 @@
+# Export
+
+- https://platform.ultralytics.com/348-scorpion/example-project/yolo26n
+- python py/yolo26n2ncnn.py
+
 # NCNN Android YOLO26
 
 Real-time object detection Android application using YOLO26n with NCNN framework.
