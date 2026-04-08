@@ -3,7 +3,7 @@
     <string name="app_name">DetectEverything</string>
 
     <string-array name="model_array">
-        <item>yolo26n</item>
+        <item>yolo26n2</item>
     </string-array>
 
     <string-array name="device_array">

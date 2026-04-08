@@ -20,6 +20,11 @@
 #define TAG "YOLO26"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 
+// 优化 1: 将矩形面积预计算，避免 NMS 中重复计算
+struct ObjectOpt : Object {
+    float area;
+};
+
 static inline float intersection_area(const Object& a, const Object& b)
 {
     cv::Rect_<float> inter = a.rect & b.rect;
@@ -49,137 +54,90 @@ static void qsort_descent_inplace(std::vector<Object>& objects, int left, int ri
     if (i < right) qsort_descent_inplace(objects, i, right);
 }
 
-static void qsort_descent_inplace(std::vector<Object>& objects)
-{
-    if (objects.empty()) return;
-    qsort_descent_inplace(objects, 0, (int)objects.size() - 1);
+static void qsort_descent_inplace(std::vector<ObjectOpt>& objects, int left, int right) {
+    int i = left;
+    int j = right;
+    float p = objects[(left + right) / 2].prob;
+    while (i <= j) {
+        while (objects[i].prob > p) i++;
+        while (objects[j].prob < p) j--;
+        if (i <= j) {
+            std::swap(objects[i], objects[j]);
+            i++;
+            j--;
+        }
+    }
+    if (left < j) qsort_descent_inplace(objects, left, j);
+    if (i < right) qsort_descent_inplace(objects, i, right);
 }
 
-static void nms_sorted_bboxes(const std::vector<Object>& objects, std::vector<int>& picked, float nms_threshold, bool agnostic = false)
-{
+static void nms_sorted_bboxes(const std::vector<ObjectOpt>& objects, std::vector<int>& picked, float nms_threshold, bool agnostic = false) {
     picked.clear();
-
     const int n = (int)objects.size();
-    std::vector<float> areas(n);
-    for (int i = 0; i < n; i++)
-        areas[i] = objects[i].rect.area();
-
-    for (int i = 0; i < n; i++)
-    {
-        const Object& a = objects[i];
-
+    for (int i = 0; i < n; i++) {
+        const ObjectOpt& a = objects[i];
         int keep = 1;
-        for (int j = 0; j < (int)picked.size(); j++)
-        {
-            const Object& b = objects[picked[j]];
-
-            if (!agnostic && a.label != b.label)
-                continue;
-
+        for (int j = 0; j < (int)picked.size(); j++) {
+            const ObjectOpt& b = objects[picked[j]];
+            if (!agnostic && a.label != b.label) continue;
             float inter_area = intersection_area(a, b);
-            float union_area = areas[i] + areas[picked[j]] - inter_area;
-            float iou = union_area > 0.f ? (inter_area / union_area) : 0.f;
-
-            if (iou > nms_threshold)
-            {
+            float iou = inter_area / (a.area + b.area - inter_area);
+            if (iou > nms_threshold) {
                 keep = 0;
                 break;
             }
         }
-
         if (keep) picked.push_back(i);
     }
 }
 
-static void generate_proposals_yolo26(const ncnn::Mat& pred,
-                                      float prob_threshold,
-                                      std::vector<Object>& objects,
-                                      float* out_global_max = nullptr)
-{
+// 优化 2: 极大优化内存访问模式
+static void generate_proposals_yolo26(const ncnn::Mat& pred, float prob_threshold, std::vector<ObjectOpt>& objects) {
     objects.clear();
-
-    if (pred.dims != 2)
-    {
-        LOGD("generate_proposals: unexpected pred.dims=%d (expected 2)", pred.dims);
-        if (out_global_max) *out_global_max = 0.f;
-        return;
-    }
-
     const int num_proposals = pred.w;        // 8400
     const int num_feat      = pred.h;        // 84
     const int num_class     = num_feat - 4;  // 80
 
-    if (num_feat != 84)
-    {
-        LOGD("generate_proposals: unexpected pred.h=%d (expected 84=4+80)", num_feat);
-        if (out_global_max) *out_global_max = 0.f;
-        return;
+    // 预取所有行的指针，避免在循环内调用 pred.row()
+    const float* row_ptrs[84];
+    for (int i = 0; i < 84; i++) {
+        row_ptrs[i] = pred.row(i);
     }
 
-    const float* ptr_cx = pred.row(0);
-    const float* ptr_cy = pred.row(1);
-    const float* ptr_w  = pred.row(2);
-    const float* ptr_h  = pred.row(3);
+    // 预分配空间，减少 vector 扩容开销
+    objects.reserve(256);
 
-    float global_max = 0.f;
-
-    for (int i = 0; i < num_proposals; i++)
-    {
+    for (int i = 0; i < num_proposals; i++) {
         int label = -1;
-        float score = 0.f;
+        float score = -1.f;
 
-        for (int k = 0; k < num_class; k++)
-        {
-            const float* row_cls = pred.row(4 + k);
-            float s = row_cls[i]; // already sigmoid
-            if (s > score)
-            {
+        // 寻找最大置信度类别
+        for (int k = 0; k < num_class; k++) {
+            float s = row_ptrs[4 + k][i];
+            if (s > score) {
                 score = s;
                 label = k;
             }
         }
 
-        if (score > global_max) global_max = score;
         if (score < prob_threshold) continue;
 
-        float cx = ptr_cx[i];
-        float cy = ptr_cy[i];
-        float bw = ptr_w[i];
-        float bh = ptr_h[i];
+        ObjectOpt obj;
+        // 直接读取坐标
+        float cx = row_ptrs[0][i];
+        float cy = row_ptrs[1][i];
+        float bw = row_ptrs[2][i];
+        float bh = row_ptrs[3][i];
 
-        float x0 = cx - bw * 0.5f;
-        float y0 = cy - bh * 0.5f;
-
-        Object obj;
-        obj.rect.x = x0;
-        obj.rect.y = y0;
+        obj.rect.x = cx - bw * 0.5f;
+        obj.rect.y = cy - bh * 0.5f;
         obj.rect.width  = bw;
         obj.rect.height = bh;
         obj.label = label;
         obj.prob  = score;
+        obj.area  = bw * bh; // 预计算面积
         objects.push_back(obj);
     }
-
-    if (out_global_max) *out_global_max = global_max;
-}
-
-// helpers: detect cv::Mat channel format robustly
-static int pick_pixel_type_for_ncnn(const cv::Mat& img)
-{
-    // Ultralytics expects RGB
-    // OpenCV default is BGR for CV_8UC3
-    // Camera/Bitmap pipelines sometimes yield RGBA CV_8UC4
-    int type = img.type();
-    if (type == CV_8UC3) return ncnn::Mat::PIXEL_BGR2RGB;
-    if (type == CV_8UC4) return ncnn::Mat::PIXEL_RGBA2RGB;
-    // if user already provides RGB
-    if (type == CV_8UC1)
-    {
-        // not supported directly for YOLO; caller should convert to 3 channels
-        return -1;
-    }
-    // fallback: assume BGR
-    return ncnn::Mat::PIXEL_BGR2RGB;
 }
 
 Yolo::Yolo()
@@ -245,25 +203,18 @@ int Yolo::load(AAssetManager* mgr, const char* modeltype, int _target_size, cons
     blob_pool_allocator.clear();
     workspace_pool_allocator.clear();
 
-    ncnn::set_cpu_powersave(2);
-    ncnn::set_omp_num_threads(ncnn::get_big_cpu_count());
+//    ncnn::set_cpu_powersave(2); // 绑定大核
+//    ncnn::set_omp_num_threads(ncnn::get_big_cpu_count());
 
     yolo.opt = ncnn::Option();
-
-#if NCNN_VULKAN
-    yolo.opt.use_vulkan_compute = use_gpu;
-    if (use_gpu)
-    {
-        // Force FP32 for better accuracy on GPU
-        yolo.opt.use_fp16_packed = false;
-        yolo.opt.use_fp16_storage = false;
-        yolo.opt.use_fp16_arithmetic = false;
-    }
-#endif
-
     yolo.opt.num_threads = ncnn::get_big_cpu_count();
     yolo.opt.blob_allocator = &blob_pool_allocator;
     yolo.opt.workspace_allocator = &workspace_pool_allocator;
+
+    // 优化 3: 开启 FP16 推理（CPU/GPU 均大幅提速）
+    yolo.opt.use_fp16_packed = true;
+    yolo.opt.use_fp16_storage = true;
+    yolo.opt.use_fp16_arithmetic = true;
 
     char parampath[256];
     char modelpath[256];
@@ -285,163 +236,157 @@ int Yolo::load(AAssetManager* mgr, const char* modeltype, int _target_size, cons
     return 0;
 }
 
-int Yolo::detect(const cv::Mat& input, std::vector<Object>& objects, float prob_threshold, float nms_threshold)
+// 1. 定义 Sigmoid 辅助函数
+inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+int Yolo::detect(const ncnn::Mat& input, std::vector<Object>& objects, float prob_threshold, float nms_threshold)
 {
     objects.clear();
 
-    const int img_w = input.cols;
-    const int img_h = input.rows;
+    const int img_w = input.w;
+    const int img_h = input.h;
+
+
+    __android_log_print(ANDROID_LOG_DEBUG, "Yolo26Ncnn","Resizing and img_w: %dx  img_h: %dx", img_w, img_h);
 
     // Your model is fixed 640x640 (8400 points), so target_size MUST be 640
     const int dst_size = target_size; // set to 640 in Java/C++ init
+    int new_w = dst_size;
+    int new_h = dst_size;
+    int wpad = 0;
+    int hpad = 0;
+    ncnn::Mat in_pad;
+    if (img_w != dst_size || img_h != dst_size) {
+        float scale = std::min((float)target_size / img_w, (float)target_size / img_h);
+         new_w = (int)(img_w * scale);
+         new_h = (int)(img_h * scale);
 
-    // letterbox scale to dst_size x dst_size
-    float scale = std::min(dst_size / (float)img_w, dst_size / (float)img_h);
-    int new_w = (int)std::round(img_w * scale);
-    int new_h = (int)std::round(img_h * scale);
+        __android_log_print(ANDROID_LOG_DEBUG, "Yolo26Ncnn","Resizing and padding to %dx%d", new_w, new_h);
 
-    int wpad = dst_size - new_w;
-    int hpad = dst_size - new_h;
-    int pad_left = wpad / 2;
-    int pad_top  = hpad / 2;
+        // 使用 ncnn 内置的高效缩放并直接归一化
+        ncnn::Mat in_resized;
+        ncnn::resize_bilinear(input, in_resized, new_w, new_h);
 
-    int pixel_type = pick_pixel_type_for_ncnn(input);
-    if (pixel_type < 0)
-    {
-        LOGD("Unsupported input cv::Mat type=%d (expect CV_8UC3 or CV_8UC4)", input.type());
-        return -1;
+        wpad = dst_size - new_w;
+        hpad = dst_size - new_h;
+        // 填充边距
+        ncnn::copy_make_border(in_resized, in_pad, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, ncnn::BORDER_CONSTANT, 114.f);
+    } else {
+        in_pad = input.clone();
     }
 
-    // Debug input
-    LOGD("input: w=%d h=%d type=%d (CV_8UC3=%d CV_8UC4=%d)",
-         img_w, img_h, input.type(), CV_8UC3, CV_8UC4);
-
-    ncnn::Mat in = ncnn::Mat::from_pixels_resize(
-            input.data,
-            pixel_type,
-            img_w, img_h,
-            new_w, new_h
-    );
-
-    ncnn::Mat in_pad;
-    ncnn::copy_make_border(
-            in, in_pad,
-            pad_top, hpad - pad_top,
-            pad_left, wpad - pad_left,
-            ncnn::BORDER_CONSTANT,
-            114.f
-    );
-
-    // FORCE Ultralytics default: /255
-    const float mean_vals_ultra[3] = {0.f, 0.f, 0.f};
+    // 归一化
     const float norm_vals_ultra[3] = {1 / 255.f, 1 / 255.f, 1 / 255.f};
-    in_pad.substract_mean_normalize(mean_vals_ultra, norm_vals_ultra);
-
+    in_pad.substract_mean_normalize(0, norm_vals_ultra);
+    // 执行推理
     ncnn::Extractor ex = yolo.create_extractor();
     ex.set_light_mode(true);
-
     ex.input("in0", in_pad);
-
     ncnn::Mat out;
     ex.extract("out0", out);
 
-    LOGD("YOLO26 output: dims=%d, w=%d (proposals), h=%d (features), c=%d",
-         out.dims, out.w, out.h, out.c);
+    LOGD("YOLO26 output: dims=%d, w=%d (proposals), h=%d (features), c=%d", out.dims, out.w, out.h, out.c);
 
-    std::vector<Object> proposals;
-    generate_proposals_yolo26(out, prob_threshold, proposals, nullptr);
+    // 根据实际输出维度来处理
+    if (out.dims != 2) {
+        LOGD("Unexpected output dims: %d", out.dims);
+        return -1;
+    }
+
+    // 检查维度顺序 - 如果w=84,h=8400则需要交换处理方式
+    const int num_proposals = out.w;  // 实际提案数
+    const int num_features = out.h;   // 实际特征数
+
+    LOGD("Processing output - proposals: %d, features: %d", num_proposals, num_features);
+
+
+    // 检查输出张量的维度顺序 - 修复维度顺序问题
+    std::vector<ObjectOpt> proposals;
+    proposals.clear();
+    proposals.reserve(256);
+
+    // 预取所有行的指针
+    const float *row_ptrs[84];
+    for (int i = 0; i < 84; i++) {
+        row_ptrs[i] = out.row(i);
+    }
+
+    for (int i = 0; i < num_proposals; i++) {
+        int label = -1;
+        float score = -1.f;
+
+        // 寻找最大置信度类别 (从第4个特征开始是80个类别)
+        for (int k = 0; k < 80; k++) {  // 80 classes
+            float s = row_ptrs[4 + k][i];  // 第4行之后是类别概率
+            if (s > score) {
+                score = s;
+                label = k;
+            }
+        }
+
+        if (score < prob_threshold) continue;
+
+        ObjectOpt obj;
+        // 直接读取前4个坐标值
+        float cx = row_ptrs[0][i];  // center x
+        float cy = row_ptrs[1][i];  // center y
+        float bw = row_ptrs[2][i];  // box width
+        float bh = row_ptrs[3][i];  // box height
+
+        obj.rect.x = cx - bw * 0.5f;
+        obj.rect.y = cy - bh * 0.5f;
+        obj.rect.width = bw;
+        obj.rect.height = bh;
+        obj.label = label;
+        obj.prob = score;
+        obj.area = bw * bh; // 预计算面积
+        proposals.push_back(obj);
+
+        LOGD("Processing1 transposed output format  cx: %.2f, cy: %.2f, bw: %.2f, bh: %.2f, score: %.2f",
+             cx, cy, bw, bh, score);
+    }
 
     if (proposals.empty())
         return 0;
 
-    // sort by score desc
-    qsort_descent_inplace(proposals);
+    // 排序与 NMS
+    if (proposals.size() > 1) {
+        qsort_descent_inplace(proposals, 0, proposals.size() - 1);
+    }
 
     // NMS (set nms_threshold<=0 to disable)
     std::vector<int> picked;
-    if (nms_threshold > 0.f)
-        nms_sorted_bboxes(proposals, picked, nms_threshold);
-    else
-    {
-        picked.resize(proposals.size());
-        for (int i = 0; i < (int)proposals.size(); i++) picked[i] = i;
-    }
+    nms_sorted_bboxes(proposals, picked, nms_threshold);
 
-    LOGD("after NMS: %zu", picked.size());
+    // 7. 坐标映射还原 (一次循环完成所有转换)
+    objects.clear();
+    float ratio_w = (float)img_w / new_w;
+    float ratio_h = (float)img_h / new_h;
+    float off_x = (wpad / 2) * ratio_w;
+    float off_y = (hpad / 2) * ratio_h;
 
-    int count = (int)picked.size();
-    objects.resize(count);
+    for (int idx : picked) {
+        const ObjectOpt& p = proposals[idx];
+        Object obj;
+        obj.prob = p.prob;
+        obj.label = p.label;
 
-    for (int i = 0; i < count; i++)
-    {
-        objects[i] = proposals[picked[i]];
+        // 映射回原图并裁剪边界
+        float x0 = (p.rect.x * ratio_w) - off_x;
+        float y0 = (p.rect.y * ratio_h) - off_y;
+        float x1 = ((p.rect.x + p.rect.width) * ratio_w) - off_x;
+        float y1 = ((p.rect.y + p.rect.height) * ratio_h) - off_y;
 
-        // Map from padded 640x640 coords back to original image coords
-        float x0 = (objects[i].rect.x - (float)pad_left) / scale;
-        float y0 = (objects[i].rect.y - (float)pad_top) / scale;
-        float x1 = (objects[i].rect.x + objects[i].rect.width  - (float)pad_left) / scale;
-        float y1 = (objects[i].rect.y + objects[i].rect.height - (float)pad_top) / scale;
+        obj.rect.x = std::max(0.f, x0);
+        obj.rect.y = std::max(0.f, y0);
+        obj.rect.width = std::min((float)img_w - obj.rect.x, x1 - x0);
+        obj.rect.height = std::min((float)img_h - obj.rect.y, y1 - y0);
 
-        x0 = std::max(std::min(x0, (float)(img_w - 1)), 0.f);
-        y0 = std::max(std::min(y0, (float)(img_h - 1)), 0.f);
-        x1 = std::max(std::min(x1, (float)(img_w - 1)), 0.f);
-        y1 = std::max(std::min(y1, (float)(img_h - 1)), 0.f);
-
-        objects[i].rect.x = x0;
-        objects[i].rect.y = y0;
-        objects[i].rect.width  = x1 - x0;
-        objects[i].rect.height = y1 - y0;
-    }
-
-    // sort by area desc (optional)
-    struct
-    {
-        bool operator()(const Object& a, const Object& b) const
-        {
-            return a.rect.area() > b.rect.area();
-        }
-    } objects_area_greater;
-
-    std::sort(objects.begin(), objects.end(), objects_area_greater);
-
-    return 0;
-}
-
-int Yolo::draw(cv::Mat& rgb, const std::vector<Object>& objects)
-{
-    static const cv::Scalar colors[] = {
-            cv::Scalar( 67,  54, 244), cv::Scalar( 30,  99, 233), cv::Scalar( 39, 176, 156),
-            cv::Scalar( 58, 183, 103), cv::Scalar( 81, 181,  63), cv::Scalar(150, 243,  33),
-            cv::Scalar(169, 244,   3), cv::Scalar(188, 212,   0), cv::Scalar(150, 136,   0),
-            cv::Scalar(175,  80,  76), cv::Scalar(195,  74, 139), cv::Scalar(220,  57, 205),
-            cv::Scalar(235,  59, 255), cv::Scalar(193,   7, 255), cv::Scalar(152,   0, 255),
-            cv::Scalar( 87,  34, 255), cv::Scalar( 85,  72, 121), cv::Scalar(158, 158, 158),
-            cv::Scalar(125, 139,  96)
-    };
-
-    for (size_t i = 0; i < objects.size(); i++)
-    {
-        const Object& obj = objects[i];
-        const cv::Scalar& color = colors[i % 19];
-
-        cv::rectangle(rgb, obj.rect, color, 2);
-
-        char text[256];
-        const char* label_name = (obj.label >= 0 && obj.label < 80) ? class_names[obj.label] : "unknown";
-        sprintf(text, "%s %.1f%%", label_name, obj.prob * 100);
-
-        int baseLine = 0;
-        cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-
-        int x = (int)obj.rect.x;
-        int y = (int)obj.rect.y - label_size.height - baseLine;
-        if (y < 0) y = 0;
-        if (x + label_size.width > rgb.cols) x = rgb.cols - label_size.width;
-
-        cv::rectangle(rgb, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)), color, -1);
-        cv::putText(rgb, text, cv::Point(x, y + label_size.height),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255));
+        objects.push_back(obj);
     }
 
     return 0;
 }
+

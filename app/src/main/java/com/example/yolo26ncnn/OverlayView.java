@@ -19,7 +19,6 @@ public class OverlayView extends View {
 
     private int imageWidth = 0;
     private int imageHeight = 0;
-    private boolean isFrontCamera = false;
 
     private static final int[] COLORS = {
             Color.rgb(255, 89, 94),   // Red
@@ -66,9 +65,6 @@ public class OverlayView extends View {
         this.imageHeight = height;
     }
 
-    public void setFrontCamera(boolean isFront) {
-        this.isFrontCamera = isFront;
-    }
 
     public void setResults(Yolo26Ncnn.Obj[] objects) {
         results.clear();
@@ -128,13 +124,6 @@ public class OverlayView extends View {
             float top = result.y * scale + offsetY;
             float right = (result.x + result.w) * scale + offsetX;
             float bottom = (result.y + result.h) * scale + offsetY;
-
-            // Front camera mirror
-            if (isFrontCamera) {
-                float temp = left;
-                left = viewWidth - right;
-                right = viewWidth - temp;
-            }
 
             // Clamp to view bounds
             left = Math.max(0, Math.min(left, viewWidth));

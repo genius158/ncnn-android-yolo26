@@ -20,10 +20,13 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.Camera;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
+import androidx.camera.core.resolutionselector.ResolutionSelector;
+import androidx.camera.core.resolutionselector.ResolutionStrategy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
@@ -61,7 +64,7 @@ public class MainActivity extends AppCompatActivity {
     private ProcessCameraProvider cameraProvider;
 
     private long lastDetectTime = 0;
-    private static final long DETECT_INTERVAL = 100; // 检测间隔 100ms
+    private static final long DETECT_INTERVAL = 0; // 检测间隔 100ms
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -110,7 +113,6 @@ public class MainActivity extends AppCompatActivity {
         // Switch camera button
         btnSwitchCamera.setOnClickListener(v -> {
             isFrontCamera = !isFrontCamera;
-            overlayView.setFrontCamera(isFrontCamera);
             startCamera();
         });
 
@@ -188,21 +190,23 @@ public class MainActivity extends AppCompatActivity {
         cameraProvider.unbindAll();
 
         // 选择摄像头
+        int cameraFront = isFrontCamera ? CameraSelector.LENS_FACING_FRONT : CameraSelector.LENS_FACING_BACK;
         CameraSelector cameraSelector = new CameraSelector.Builder()
-                .requireLensFacing(isFrontCamera ?
-                        CameraSelector.LENS_FACING_FRONT :
-                        CameraSelector.LENS_FACING_BACK)
+                .requireLensFacing(cameraFront)
+                .build();
+        ResolutionSelector resolutionSelector = new ResolutionSelector.Builder()
+                .setResolutionStrategy(new ResolutionStrategy(new Size(640, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER))
                 .build();
 
         // 预览
         Preview preview = new Preview.Builder()
-                .setTargetResolution(new Size(640, 480))
+                .setResolutionSelector(resolutionSelector)
                 .build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
         // 图像分析
         ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
-                .setTargetResolution(new Size(640, 480))
+                .setResolutionSelector(resolutionSelector)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build();
 
@@ -231,25 +235,39 @@ public class MainActivity extends AppCompatActivity {
         lastDetectTime = currentTime;
 
         try {
+            long cur = System.currentTimeMillis();
             // 将 ImageProxy 转换为 Bitmap
             Bitmap bitmap = imageProxyToBitmap(image);
+            Log.i(TAG, "analyzeImage: imagetype： "+image.getFormat()+"  "+image.getWidth()+"  "+image.getImageInfo().getRotationDegrees()+"  "+(System.currentTimeMillis()-cur));
+
             if (bitmap == null) {
                 image.close();
                 return;
             }
 
-            // 设置预览尺寸
-            int previewWidth = bitmap.getWidth();
-            int previewHeight = bitmap.getHeight();
-
             // Run detection
             long startTime = System.currentTimeMillis();
-            Yolo26Ncnn.Obj[] objects = yolo26Ncnn.detect(bitmap);
+            Yolo26Ncnn.Obj[] objects = yolo26Ncnn.detect(bitmap,image.getImageInfo().getRotationDegrees(),isFrontCamera);
             long inferenceTime = System.currentTimeMillis() - startTime;
+
+            Log.i(TAG, "analyzeImage: yoloDetect： " + inferenceTime);
 
             // Update UI
             final int objectCount = objects != null ? objects.length : 0;
             final long fps = 1000 / Math.max(inferenceTime, 1);
+
+
+            int rotation = image.getImageInfo().getRotationDegrees();
+            int previewWidth, previewHeight;
+
+            // 关键：如果物理旋转了，Java 层感知的宽高也必须对调
+            if (rotation == 90 || rotation == 270) {
+                previewWidth = bitmap.getHeight(); // 对应 C++ 旋转后的 cols
+                previewHeight = bitmap.getWidth(); // 对应 C++ 旋转后的 rows
+            } else {
+                previewWidth = bitmap.getWidth();
+                previewHeight = bitmap.getHeight();
+            }
 
             runOnUiThread(() -> {
                 overlayView.setPreviewSize(previewWidth, previewHeight);
@@ -287,106 +305,10 @@ public class MainActivity extends AppCompatActivity {
      */
     private Bitmap imageProxyToBitmap(ImageProxy image) {
         try {
-            ImageProxy.PlaneProxy[] planes = image.getPlanes();
-            int width = image.getWidth();
-            int height = image.getHeight();
 
-            // Y 平面
-            ByteBuffer yBuffer = planes[0].getBuffer();
-            int yRowStride = planes[0].getRowStride();
-            int yPixelStride = planes[0].getPixelStride();
-
-            // U 平面
-            ByteBuffer uBuffer = planes[1].getBuffer();
-            int uvRowStride = planes[1].getRowStride();
-            int uvPixelStride = planes[1].getPixelStride();
-
-            // V 平面
-            ByteBuffer vBuffer = planes[2].getBuffer();
-
-            // NV21 格式: Y 平面 + VU 交错平面
-            // 总大小 = width * height * 1.5
-            int nv21Size = width * height + (width * height / 2);
-            byte[] nv21 = new byte[nv21Size];
-
-            // 复制 Y 平面 (考虑 rowStride)
-            int yPos = 0;
-            if (yRowStride == width && yPixelStride == 1) {
-                // 快速路径：直接复制
-                yBuffer.get(nv21, 0, width * height);
-                yPos = width * height;
-            } else {
-                // 慢速路径：逐行复制
-                for (int row = 0; row < height; row++) {
-                    yBuffer.position(row * yRowStride);
-                    for (int col = 0; col < width; col++) {
-                        nv21[yPos++] = yBuffer.get(row * yRowStride + col * yPixelStride);
-                    }
-                }
-                yBuffer.rewind();
-            }
-
-            // 复制 VU 交错平面
-            // NV21 要求 V 在前，U 在后，交错存储
-            int uvHeight = height / 2;
-            int uvWidth = width / 2;
-            int uvPos = width * height;
-
-            if (uvPixelStride == 2 && uvRowStride == width) {
-                // 快速路径：UV 已经是交错的 (常见情况)
-                // planes[2] (V) 已经是 VUVU... 格式
-                vBuffer.position(0);
-                int uvSize = Math.min(vBuffer.remaining(), width * height / 2);
-                vBuffer.get(nv21, uvPos, uvSize);
-            } else if (uvPixelStride == 1) {
-                // 慢速路径：U 和 V 是分开的平面，需要手动交错
-                for (int row = 0; row < uvHeight; row++) {
-                    for (int col = 0; col < uvWidth; col++) {
-                        int uvIndex = row * uvRowStride + col * uvPixelStride;
-                        // NV21: V 先，U 后
-                        nv21[uvPos++] = vBuffer.get(uvIndex);  // V
-                        nv21[uvPos++] = uBuffer.get(uvIndex);  // U
-                    }
-                }
-            } else {
-                // 通用路径
-                for (int row = 0; row < uvHeight; row++) {
-                    for (int col = 0; col < uvWidth; col++) {
-                        int uvIndex = row * uvRowStride + col * uvPixelStride;
-                        nv21[uvPos++] = vBuffer.get(uvIndex);  // V
-                        nv21[uvPos++] = uBuffer.get(uvIndex);  // U
-                    }
-                }
-            }
-
-            // 使用 YuvImage 转换为 JPEG，然后解码为 Bitmap
-            YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            yuvImage.compressToJpeg(new Rect(0, 0, width, height), 95, out);
-            byte[] imageBytes = out.toByteArray();
-
-            Bitmap bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
-
-            // 旋转图像
-            Matrix matrix = new Matrix();
-            int rotationDegrees = image.getImageInfo().getRotationDegrees();
-            if (rotationDegrees != 0) {
-                matrix.postRotate(rotationDegrees);
-            }
-
-            // 如果是前置摄像头，需要镜像翻转
-            if (isFrontCamera) {
-                matrix.postScale(-1, 1);
-            }
-
-            if (rotationDegrees != 0 || isFrontCamera) {
-                Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
-                if (rotatedBitmap != bitmap) {
-                    bitmap.recycle();
-                }
-                return rotatedBitmap;
-            }
-
+            long cur = System.currentTimeMillis();
+            Bitmap bitmap = image.toBitmap();
+            Log.i(TAG, "analyzeImage imageProxyToBitmap: "+(System.currentTimeMillis()-cur));
             return bitmap;
 
         } catch (Exception e) {
