@@ -25,7 +25,7 @@ struct ObjectOpt : Object {
 
 static inline float intersection_area(const Object& a, const Object& b)
 {
-    cv::Rect_<float> inter = a.rect & b.rect;
+    BBox inter = a.rect & b.rect;
     return inter.area();
 }
 

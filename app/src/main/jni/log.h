@@ -31,4 +31,9 @@ void set_log_enabled(int enabled);
 #define LOGW(...) if(g_log_enabled) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #endif
 
+// force log
+#define FLOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+#define FLOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define FLOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+
 #endif //YOLO26NCNN_LOG_H

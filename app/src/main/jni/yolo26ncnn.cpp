@@ -78,14 +78,14 @@ JNIEXPORT jboolean JNICALL Java_com_example_yolo26ncnn_Yolo26Ncnn_loadModel(JNIE
     LOGD( "Yolo26Ncnn loadModel %p", mgr);
 
     const char* modeltype = "yolo26n5";
-    bool use_gpu = (useGpu == 1);
+    bool use_gpu = true;
 
     {
         ncnn::MutexLockGuard g(lock);
 
         // Check GPU availability
         if (use_gpu && ncnn::get_gpu_count() == 0) {
-            LOGW( "GPU not available, falling back to CPU");
+            FLOGW("GPU not available, falling back to CPU");
             use_gpu = false;
         }
 
@@ -97,9 +97,9 @@ JNIEXPORT jboolean JNICALL Java_com_example_yolo26ncnn_Yolo26Ncnn_loadModel(JNIE
         }
 
         const char* device_name = use_gpu ? "GPU (FP32)" : "CPU";
-        LOGD( "Yolo26Ncnn Loading model: %s on %s", modeltype, device_name);
+        FLOGI( "Yolo26Ncnn Loading model: %s on %s", modeltype, device_name);
         g_yolo->load(mgr, modeltype, YOLO26_TARGET_SIZE, YOLO26_MEAN_VALS, YOLO26_NORM_VALS, use_gpu);
-        LOGD( "Yolo26Ncnn Model loaded successfully");
+        FLOGI( "Yolo26Ncnn Model loaded successfully");
 
 
         if (objCls == nullptr){
@@ -131,7 +131,7 @@ Java_com_example_yolo26ncnn_Yolo26Ncnn_detect(JNIEnv *env, jobject thiz, jobject
     }
 
     if (bitmapInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
-        LOGD( "Yolo26Ncnn Only RGBA_8888 supported");
+        FLOGD( "Yolo26Ncnn Only RGBA_8888 supported");
         return nullptr;
     }
 

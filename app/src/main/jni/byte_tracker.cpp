@@ -10,7 +10,7 @@
 
 // ============== STrack Implementation ==============
 
-STrack::STrack(const cv::Rect_<float>& bbox, float score, int classId)
+STrack::STrack(const BBox& bbox, float score, int classId)
     : m_bbox(bbox), m_score(score), m_classId(classId), m_trackId(-1), m_frameId(0),
       m_startFrame(0), m_timeSinceUpdate(0), m_isActivated(false),
       m_state(TrackState::New) {
@@ -295,7 +295,7 @@ std::vector<std::vector<float>> ByteTracker::calcIoUCostMatrix(
     return costMatrix;
 }
 
-float ByteTracker::calcIoU(const std::vector<float>& tlwh1, const cv::Rect_<float>& bbox2) {
+float ByteTracker::calcIoU(const std::vector<float>& tlwh1, const BBox& bbox2) {
     float x1 = std::max(tlwh1[0], bbox2.x);
     float y1 = std::max(tlwh1[1], bbox2.y);
     float x2 = std::min(tlwh1[0] + tlwh1[2], bbox2.x + bbox2.width);

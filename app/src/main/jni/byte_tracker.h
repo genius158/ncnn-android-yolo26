@@ -24,7 +24,7 @@ enum class TrackState {
 // Single track
 class STrack {
 public:
-    STrack(const cv::Rect_<float>& bbox, float score, int classId);
+    STrack(const BBox& bbox, float score, int classId);
 
     void predict();
     void update(const Object& det);
@@ -51,7 +51,7 @@ private:
     std::vector<float> m_mean;  // [x, y, a, h, vx, vy, va, vh]
     std::vector<float> m_covariance;
 
-    cv::Rect_<float> m_bbox;
+    BBox m_bbox;
     float m_score;
     int m_classId;
     int m_trackId;
@@ -115,7 +115,7 @@ private:
     );
 
     // IoU calculation
-    float calcIoU(const std::vector<float>& tlwh1, const cv::Rect_<float>& bbox2);
+    float calcIoU(const std::vector<float>& tlwh1, const BBox& bbox2);
 };
 
 #endif // BYTE_TRACKER_H
